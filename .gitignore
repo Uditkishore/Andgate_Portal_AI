@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+db.sqlite3
+.env
+.env
+.venv
+env/
+venv/
+chatbot/models/mistral-7b-instruct-v0.1.Q4_0.gguf
+#requirements.txt
+requirements.txt
