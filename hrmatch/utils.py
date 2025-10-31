@@ -1,282 +1,249 @@
 import os
-import pymongo
+import re
+import json
 import base64
-import fitz  # PyMuPDF for PDF parsing
+import fitz
+import pymongo
+import logging
+import warnings
+from bson import ObjectId
+from datetime import datetime, timedelta
+from pathlib import Path
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from chatbot.offline_loader import OfflineSentenceTransformerEmbeddings
 from llama_cpp import Llama
-import re
-import json
-from bson import ObjectId
+from chatbot.offline_loader import OfflineSentenceTransformerEmbeddings
 from django.conf import settings
-from pathlib import Path
-from datetime import datetime, timedelta
 
+# ============================================================
+# 🔇 Hide Logs and Warnings
+# ============================================================
+logging.getLogger("llama_cpp").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.db.duckdb").setLevel(logging.CRITICAL)
+logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# --- MongoDB setup ---
+# ============================================================
+# MongoDB Setup
+# ============================================================
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 client = pymongo.MongoClient(MONGO_URI)
 db = client["Andgate_Portal"]
 uploads_collection = db.get_collection("uploads")
 
-# --- Embeddings & Vector DB ---
+# ============================================================
+# Embedding Model & Vector DB
+# ============================================================
 embedding_model = OfflineSentenceTransformerEmbeddings()
 VECTOR_DB_PATH = "chatbot/vector_data"
-
 vector_db = None
-
-# --- Local uploads folder (where decoded PDFs will be saved) ---
 LOCAL_UPLOAD_FOLDER = r"E:\HRMS project\AndgatePortal\django_api\src\uploads"
 os.makedirs(LOCAL_UPLOAD_FOLDER, exist_ok=True)
 
-# --- Initialize Chroma vector DB ---
-def initialize_vector_db():
-    """
-    Initialize Chroma vector DB and sync any new resumes from Mongo.
-    """
-    global vector_db
-    if vector_db is None:
-        vector_db = Chroma(
-            persist_directory=VECTOR_DB_PATH,
-            embedding_function=embedding_model
-        )
-    sync_new_resumes()  # Always check for new records
-    return vector_db
-
-
-# --- Helper: Extract text from base64 PDF ---
+# ============================================================
+# PDF Utilities
+# ============================================================
 def extract_text_from_pdf_base64(base64_str: str) -> str:
     try:
         pdf_bytes = base64.b64decode(base64_str)
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text = "\n".join(page.get_text("text") for page in doc)
-        return text.strip()
-    except Exception as e:
-        print(f"⚠️ PDF decode failed: {e}")
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return "\n".join(page.get_text("text") for page in doc).strip()
+    except Exception:
         return ""
 
-
-# --- Helper: Load text from file path ---
 def load_pdf_content(file_path: str) -> str:
-    """
-    Load and extract text from a PDF file.
-    """
     if not os.path.exists(file_path):
-        # don't flood logs for each chunk — only high-level caller prints if needed
         return ""
     try:
         with fitz.open(file_path) as doc:
             return "\n".join(page.get_text("text") for page in doc).strip()
-    except Exception as e:
-        print(f"⚠️ Error reading {file_path}: {e}")
+    except Exception:
         return ""
 
+# ============================================================
+# Vector DB Initialization
+# ============================================================
+def initialize_vector_db():
+    global vector_db
+    if vector_db is None:
+        vector_db = Chroma(persist_directory=VECTOR_DB_PATH, embedding_function=embedding_model)
+    sync_new_resumes()
+    return vector_db
 
-# --- Keyword extractor for queries ---
-_STOPWORDS = {
-    "find", "finds", "top", "show", "showing", "show me", "list", "get",
-    "return", "candidates", "candidate", "resume", "resumes", "page", "out",
-    "of", "the", "a", "an", "for", "with", "and", "or", "in", "on", "by",
-    "role", "position", "need", "looking", "seeking", "hire", "hiring",
-    "please", "these", "that", "is", "are", "i", "me", "my"
-}
-
-
-def extract_keywords(q: str):
-    """
-    Lightweight keyword extractor:
-    - normalizes c++ / c#
-    - splits on non-word characters
-    - removes stopwords and pure-numbers
-    - returns ordered unique keywords (lowercase)
-    """
-    if not q:
-        return []
-    q = q.lower()
-    q = q.replace("c++", "cpp").replace("c#", "csharp")
-    # remove punctuation except plus/hash already normalized
-    tokens = re.findall(r"\b[\w\+\#\-\.]+\b", q)
-    out = []
-    seen = set()
-    for t in tokens:
-        if t.isdigit():
-            continue
-        if t in _STOPWORDS:
-            continue
-        if len(t) <= 1:
-            continue
-        # skip common role words
-        if t in {"developer", "developers", "engineer", "engineers", "dev", "position", "role"}:
-            continue
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-# --- Sync new resumes ---
 def sync_new_resumes():
-    """
-    Sync MongoDB resumes from 'uploads' collection into Chroma.
-    - Decodes base64 PDFs into local folder
-    - Extracts text and updates Mongo with absolute filePath
-    - Adds chunks to Chroma
-    """
     global vector_db
     if vector_db is None:
         raise ValueError("Vector DB not initialized")
 
-    # collect already indexed upload ids (if present in metadatas)
-    existing_ids = set()
-    all_data = vector_db.get()
-    if "metadatas" in all_data:
-        for meta in all_data["metadatas"]:
-            if meta and "upload_id" in meta:
-                existing_ids.add(meta["upload_id"])
-
+    existing_ids = set(meta.get("upload_id") for meta in vector_db.get().get("metadatas", []) if meta)
     new_docs = []
+
     for upload in uploads_collection.find():
         uid = str(upload["_id"])
         if uid in existing_ids:
-            # already indexed
             continue
 
-        resume_text = ""
         filename = upload.get("fileName", f"{uid}.pdf")
         local_path = os.path.join(LOCAL_UPLOAD_FOLDER, filename)
 
-        # Prefer base64 'file' field (you said every doc has base64)
         if upload.get("file"):
             try:
-                # write only if missing (safe)
                 if not os.path.exists(local_path):
                     with open(local_path, "wb") as f:
                         f.write(base64.b64decode(upload["file"]))
-                    print(f"✅ Saved PDF to: {local_path}")
-
-                    # update Mongo filePath to absolute path for future use
-                    try:
-                        uploads_collection.update_one(
-                            {"_id": ObjectId(uid)},
-                            {"$set": {"filePath": str(local_path)}}
-                        )
-                    except Exception as e:
-                        print(f"⚠️ Failed to update Mongo filePath for {uid}: {e}")
-
-                resume_text = load_pdf_content(local_path)
-            except Exception as e:
-                print(f"⚠️ Error handling base64 for {uid}: {e}")
+                    uploads_collection.update_one({"_id": ObjectId(uid)}, {"$set": {"filePath": str(local_path)}})
+            except Exception:
                 continue
 
-        # fallback if no base64 but filePath exists
-        elif upload.get("filePath"):
-            raw_path = upload["filePath"]
-            normalized = Path(raw_path.replace("/", os.sep).replace("\\", os.sep))
-            if normalized.is_absolute():
-                absolute_path = normalized
-            else:
-                absolute_path = Path(settings.BASE_DIR) / normalized
-            if absolute_path.exists():
-                resume_text = load_pdf_content(str(absolute_path))
-            else:
-                print(f"❌ File missing for DB record {uid}: {absolute_path}")
-                continue
-
-        # if still empty, skip
-        if not resume_text or not resume_text.strip():
+        text = load_pdf_content(local_path)
+        if not text:
             continue
 
-        # chunk and add
         splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_text(resume_text)
-        docs = [
-            Document(
-                page_content=chunk,
-                metadata={
-                    "upload_id": uid,
-                    "filename": filename,
-                },
-            )
-            for chunk in chunks
-        ]
+        chunks = splitter.split_text(text)
+        docs = [Document(page_content=c, metadata={"upload_id": uid, "filename": filename}) for c in chunks]
         new_docs.extend(docs)
 
     if new_docs:
         vector_db.add_documents(new_docs)
         vector_db.persist()
-        print(f"✅ Indexed {len(new_docs)} new document chunks.")
 
+# ============================================================
+# Keyword Extractor
+# ============================================================
+def extract_keywords(query: str):
+    if not query:
+        return []
+
+    query = query.lower().strip()
+    tokens = query.split()
+    keywords = [query]
+
+    for n in range(3, 0, -1):
+        for i in range(len(tokens) - n + 1):
+            phrase = " ".join(tokens[i:i+n]).strip()
+            if len(phrase) > 2 and phrase not in keywords:
+                keywords.append(phrase)
+
+    GENERAL_NOISE = set([
+        "find", "top", "candidates", "with", "for", "the", "a", "an",
+        "of", "and", "or", "developer", "engineer", "candidate", "role", "looking"
+    ])
+
+    final_keywords = []
+    for kw in keywords:
+        if kw == query:
+            continue
+        is_technical = bool(re.search(r'[0-9\.\-#/]', kw))
+        is_pure_noise = all(word in GENERAL_NOISE for word in kw.split())
+        if (is_technical or not is_pure_noise) and len(kw) > 2:
+            final_keywords.append(kw)
+
+    return sorted(list(set(final_keywords)), key=len, reverse=True)
+
+# ============================================================
+# LLM Initialization
+# ============================================================
+def initialize_llm():
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(base_dir)
+        model_path = os.path.join(project_root, "chatbot", "models", "mistral-7b-instruct-v0.1.Q4_0.gguf")
+        llm = Llama(model_path=model_path, n_ctx=2048, n_threads=4, verbose=False)
+        return llm
+    except Exception as e:
+        logging.error(f"Error initializing LLM: {e}")
+        return None
+
+# ============================================================
+# Experience Extraction
+# ============================================================
 def extract_experience_years(text: str) -> float:
-    """
-    Estimate years of experience from free text using a hybrid filter approach.
-    - Detects numeric patterns like "5 years of experience" or "6 months exp"
-    - Detects phrases like "since 2016" and computes years dynamically
-    - Returns float (e.g., 7.5, 3.0, etc.)
-    """
     if not text:
         return 0.0
-
     text = text.lower()
-    tokens = re.findall(r'\b[\w\.]+\b', text)
+    MAX_YEARS = 50
     years_found = []
 
-    # --- 1️⃣ Token proximity check around 'experience' or 'exp'
-    for i, tok in enumerate(tokens):
-        if tok.startswith(('exp', 'experience')):
-            window = tokens[max(0, i - 6):i + 6]
-            for j, w in enumerate(window):
-                # detect numbers like 5, 5+, 5.5
-                if w.replace('.', '', 1).isdigit():
-                    num = float(w.replace('+', ''))
-                    next_tokens = window[j + 1:j + 3]
-                    if any(x in next_tokens for x in ["year", "years", "yr", "yrs"]):
-                        years_found.append(num)
-                    elif any(x in next_tokens for x in ["month", "months"]):
-                        years_found.append(round(num / 12, 2))
+    for m in re.finditer(r'(\d{1,2}(?:\.\d+)?)\s*(?:\+)?\s*(years|year|yrs|yr|months|month)\b', text):
+        num = float(m.group(1))
+        unit = m.group(2)
+        if 'month' in unit:
+            years_found.append(round(num / 12.0, 2))
+        else:
+            years_found.append(num)
 
-    # --- 2️⃣ "Over X years" or "Having X years" even without "experience"
-    for i, tok in enumerate(tokens):
-        if tok in {"over", "around", "about", "having"}:
-            window = tokens[i:i + 5]
-            for j, w in enumerate(window):
-                if w.replace('.', '', 1).isdigit():
-                    num = float(w.replace('+', ''))
-                    if any(x in window[j + 1:j + 3] for x in ["year", "years", "yr", "yrs"]):
-                        years_found.append(num)
+    for m in re.finditer(r'(\b19\d{2}|\b20\d{2})\s*(?:[-–—]|to)\s*(\b19\d{2}|\b20\d{2})', text):
+        try:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 1900 < a <= datetime.utcnow().year and b >= a:
+                diff = b - a
+                if 0 < diff <= MAX_YEARS:
+                    years_found.append(float(diff))
+        except:
+            pass
 
-    # --- 3️⃣ Handle "since 2016" or "from 2018" style dates
-    current_year = datetime.utcnow().year
-    for i, tok in enumerate(tokens):
-        if tok in {"since", "from"} and i + 1 < len(tokens):
-            nxt = tokens[i + 1]
-            if nxt.isdigit() and len(nxt) == 4:
-                year_val = int(nxt)
-                if 1970 < year_val <= current_year:
-                    years_found.append(current_year - year_val)
+    for m in re.finditer(r'\b(?:since|from)\s+(\d{4})\b', text):
+        try:
+            y = int(m.group(1))
+            current = datetime.utcnow().year
+            if 1900 < y <= current:
+                diff = current - y
+                if 0 < diff <= MAX_YEARS:
+                    years_found.append(float(diff))
+        except:
+            pass
 
-    # --- Pick the most plausible experience value
-    if years_found:
-        plausible_years = [y for y in years_found if 0 < y <= 50]
-        if plausible_years:
-            return round(max(plausible_years), 1)
+    cleaned = [y for y in years_found if 0 < y <= MAX_YEARS]
+    return round(max(cleaned), 1) if cleaned else 0.0
 
-    return 0.0
+# ============================================================
+# Requirement Interpretation
+# ============================================================
+def interpret_requirement(query: str, llm: Llama):
+    prompt = f"""
+You are an AI HR recruiter assistant.
+Extract key skills, role, and top_k (if mentioned) from the HR query.
+Be thorough and accurate.
+Return JSON ONLY:
+{{
+  "requirement_summary": "short summary",
+  "skills": ["list", "of", "skills"],
+  "role": "role name if any",
+  "top_k": "integer or null"
+}}
+Query: "{query}"
+"""
+    try:
+        response = llm(prompt, max_tokens=512, temperature=0.2)
+        text = response["choices"][0]["text"].strip()
+        return json.loads(text)
+    except Exception:
+        match = re.search(r"top\s+(\d+)", query.lower())
+        return {
+            "requirement_summary": query,
+            # "skills": [],
+            # "role": "",
+            "top_k": int(match.group(1)) if match else None
+        }
 
-def search_candidates(requirement_text: str, page: int = 1, page_size: int = 20, top_k: int = None):
+# ============================================================
+# Candidate Search
+# ============================================================
+def search_candidates(requirement_text: str, page: int = 1, page_size: int = 20, top_k: int = None, skills: list = None):
     global vector_db
     if vector_db is None:
         initialize_vector_db()
 
-    keywords = extract_keywords(requirement_text)
-    if top_k is None:
-        m = re.search(r"\btop\s+(\d+)\b", requirement_text.lower())
-        if m:
-            try:
-                top_k = int(m.group(1))
-            except:
-                top_k = None
+    if not skills:
+        skills = re.findall(r"[a-zA-Z\+\#\.\-/]{3,}", requirement_text.lower())
+
+    skills = [s.lower().strip() for s in skills if s.strip()]
+    RECENT_DAYS = 30
+    recent_cutoff = datetime.utcnow() - timedelta(days=RECENT_DAYS)
 
     try:
         all_data = vector_db.get()
@@ -284,230 +251,161 @@ def search_candidates(requirement_text: str, page: int = 1, page_size: int = 20,
         if total_chunks == 0:
             return {"candidates": [], "total_count": 0}
 
-        search_k = min(200, total_chunks)
+        search_k = min(300, total_chunks)
         results = vector_db.similarity_search_with_score(requirement_text, k=search_k)
 
-        candidate_map = {}
+        agg = {}
         for doc, score in results:
             uid = doc.metadata.get("upload_id")
             if not uid:
                 continue
+            rel = 1.0 / (1.0 + float(score)) if score is not None else 1.0
+            agg.setdefault(uid, {"score": 0, "filename": doc.metadata.get("filename")})
+            agg[uid]["score"] += rel
 
-            content = (doc.page_content or "").lower()
-            if keywords:
-                if not any(kw in content for kw in keywords):
-                    continue
-
+        candidates = []
+        for uid, meta in agg.items():
             try:
-                relevance = 1.0 / (1.0 + float(score))
+                upload = uploads_collection.find_one({"_id": ObjectId(uid)})
             except Exception:
-                relevance = 1.0
-
-            if uid not in candidate_map:
-                candidate_map[uid] = {
-                    "id": uid,
-                    "filename": doc.metadata.get("filename") or f"resume_{uid}.pdf",
-                    "score": relevance,
-                    "chunks": 1
-                }
-            else:
-                candidate_map[uid]["score"] += relevance
-                candidate_map[uid]["chunks"] += 1
-
-        if not candidate_map:
-            return {"candidates": [], "total_count": 0}
-        
-
-        # ✅ New: Filter by recency (last 30 days) and dynamically extract experience
-        recent_cutoff = datetime.utcnow() - timedelta(days=30)
-        valid_candidates = []
-
-        for uid, data in candidate_map.items():
-            upload = uploads_collection.find_one({"_id": ObjectId(uid)}, {"updatedAt": 1, "file": 1, "filePath": 1})
+                continue
             if not upload:
                 continue
 
-            # --- 1️⃣ Check recency ---
-            updated_at = upload.get("updatedAt")
-            if isinstance(updated_at, dict) and "$date" in updated_at:
-                updated_at = datetime.fromisoformat(upload["updatedAt"]["$date"].replace("Z", "+00:00"))
-            elif isinstance(updated_at, str):
+            updated_at = upload.get("updatedAt") or upload.get("updated_at")
+            if isinstance(updated_at, str):
                 try:
                     updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
                 except:
                     updated_at = None
 
             if not updated_at or updated_at < recent_cutoff:
-                continue  # skip resumes older than 30 days
+                continue
 
-            # --- 2️⃣ Extract text (from local or base64) ---
             resume_text = ""
             file_path = upload.get("filePath")
-
             if file_path and os.path.exists(file_path):
                 resume_text = load_pdf_content(file_path)
-            elif upload.get("file"):  # fallback: base64
-                resume_text = extract_text_from_pdf_base64(upload["file"])
+            elif upload.get("file"):
+                resume_text = extract_text_from_pdf_base64(upload.get("file"))
 
             if not resume_text.strip():
                 continue
 
-            # --- 3️⃣ Dynamically extract experience (no DB save) ---
-            experience = extract_experience_years(resume_text)
-            data["experience_years"] = experience
-            data["updated_at"] = updated_at
-            valid_candidates.append(data)
+            if skills:
+                content_lower = resume_text.lower()
+                if not any(re.search(r'\b' + re.escape(s) + r'\b', content_lower) for s in skills):
+                    continue
 
+            exp = extract_experience_years(resume_text)
+            if exp < 0 or exp > 50:
+                exp = 0.0
 
-        if not valid_candidates:
-            return {"candidates": [], "total_count": 0, "message": "No recently updated resumes found"}
+            candidates.append({
+                "id": uid,
+                "filename": meta.get("filename"),
+                "score": meta["score"],
+                "experience_years": exp,
+                "updated_at": updated_at
+            })
 
-        # ✅ New: Sort primarily by experience, then by relevance
-        sorted_candidates = sorted(
-            valid_candidates,
-            key=lambda x: (x.get("experience_years", 0), x.get("score", 0)),
-            reverse=True
-        )
+        if not candidates:
+            return {"candidates": [], "total_count": 0}
 
-        # Apply top_k or pagination
-        if top_k:
-            selected = sorted_candidates[:top_k]
-        else:
-            start = (page - 1) * page_size
-            end = start + page_size
-            selected = sorted_candidates[start:end]
+        candidates = sorted(candidates, key=lambda c: (-c["experience_years"], -c["score"]))
+        total = len(candidates)
+        selected = candidates[:top_k] if top_k else candidates[(page - 1) * page_size: page * page_size]
 
-        response_candidates = [
-            {
-                "id": c["id"],
-                "filename": c["filename"],
-                "experience_years": c.get("experience_years", 0),
-                "last_updated": c.get("updated_at").strftime("%Y-%m-%d") if c.get("updated_at") else None
-            }
-            for c in selected
-        ]
-
-        return {"candidates": response_candidates, "total_count": len(valid_candidates)}
+        return {"candidates": [{
+            "id": c["id"],
+            "filename": c["filename"],
+            "experience_years": c["experience_years"],
+            "last_updated": c["updated_at"].isoformat()
+        } for c in selected], "total_count": total}
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logging.error(f"Search failed: {str(e)}")
         return {"error": f"Search failed: {str(e)}"}
 
+# ============================================================
+# HR Query Handler (Updated)
+# ============================================================
+def handle_hr_query(query: str):
+    global llm
+    
+    # --- Initialization Logic (Keep Indented) ---
+    if llm is None:
+        llm = initialize_llm()
+    if not llm:
+        return {"error": "LLM not available"}
 
-# --- LLaMA model (used only for parse if needed) ---
-def initialize_llm():
+    # --- Main Processing Logic (Must be UNINDENTED) ---
+    interpretation = interpret_requirement(query, llm)
+    llm_skills = interpretation.get("skills", [])
+    rule_skills = extract_keywords(query)
+    merged_skills = list(set([s.lower().strip() for s in llm_skills + rule_skills if s.strip()]))
+    interpretation["skills"] = merged_skills
+    
+    search_results = search_candidates(
+        requirement_text=interpretation["requirement_summary"],
+        top_k=interpretation["top_k"],
+        skills=merged_skills
+    )
+    
+    summary_prompt = f"""
+Summarize the following candidate search results clearly for an HR recruiter.
+Query: {query}
+Candidates:
+{json.dumps(search_results.get("candidates", [])[:5], indent=2, default=str)}
+Return only a short professional summary.
+"""
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))  # hrmatch/
-        project_root = os.path.dirname(base_dir)  # django_api/
-        model_path = os.path.join(project_root, "chatbot", "models", "mistral-7b-instruct-v0.1.Q4_0.gguf")
+        resp = llm(summary_prompt, max_tokens=256, temperature=0.3)
+        summary = resp["choices"][0]["text"].strip()
+    except Exception:
+        summary = "Candidates ranked by experience and relevance."
 
-        return Llama(
-            model_path=model_path,
-            n_ctx=32768,
-            n_threads=4,
-            use_mlock=True,
-            verbose=False
-        )
-    except Exception as e:
-        print(f"❌ Error initializing LLM: {str(e)}")
-        return None
+    # Delete the internal keys from interpretation before returning
+    if "skills" in interpretation:
+        del interpretation["skills"]
+    if "top_k" in interpretation:
+        del interpretation["top_k"]
+    if "role" in interpretation:
+        del interpretation["role"]
+    
+    return {
+        "query_analysis": interpretation,
+        "results": search_results,
+        "summary": summary
+    }
 
-
-# --- Initialize on import ---
+# ============================================================
+# Auto Initialization
+# ============================================================
 try:
     retriever = initialize_vector_db()
     llm = initialize_llm()
 except Exception as e:
-    print(f"❌ Initialization error: {str(e)}")
-    retriever = None
-    llm = None
+    logging.error(f"Initialization error: {e}")
 
 
-# --- Intent parser (deterministic) ---
-def parse_requirement_with_llm(hr_query: str, prev_requirement: str, prev_page: int, prev_page_size: int):
-    prompt = f"""
-You are an AI HR query interpreter.
 
-Your job is to extract search intent from HR queries for candidate matching.
 
-When analyzing the query:
-1. Detect if the query is a NEW requirement or CONTINUATION.
-2. Extract skills or technologies (e.g., python, java, verilog, uvm).
-3. Identify the role or domain (e.g., software developer, VLSI engineer).
-4. Detect requested top_k if mentioned (like "top 15" or "top 10").
-5. Keep pagination consistent if "next" or "more" is mentioned.
 
-Return JSON ONLY in this format:
-{{
-  "mode": "new" | "continue",
-  "requirement": "...",
-  "page": int,
-  "page_size": int,
-  "top_k": int | null,
-  "skills": [list of skills or keywords],
-  "role": "string describing job role"
-}}
 
-Examples:
-Input: "Find top 10 VLSI verification engineers with UVM skills"
-Output:
-{{
-  "mode": "new",
-  "requirement": "Find top 10 VLSI verification engineers with UVM skills",
-  "page": 1,
-  "page_size": 20,
-  "top_k": 10,
-  "skills": ["VLSI", "UVM"],
-  "role": "verification engineer"
-}}
 
-Input: "Next 20 candidates"
-Output:
-{{
-  "mode": "continue",
-  "requirement": "previous requirement",
-  "page": 2,
-  "page_size": 20,
-  "top_k": null,
-  "skills": [],
-  "role": ""
-}}
 
-Now analyze:
-HR Query: "{hr_query}"
-Previous Requirement: "{prev_requirement}"
-Previous Page: {prev_page}
-Previous Page Size: {prev_page_size}
 
-Return JSON ONLY in this format:
-{{
-  "mode": "new" | "continue",
-  "requirement": "...",
-  "page": int,
-  "page_size": int,
-  "top_k": int | null
-}}
-"""
-    if llm is None:
-        # fallback simple parser (no LLM)
-        match = re.search(r"top\s+(\d+)", hr_query.lower())
-        top_k = int(match.group(1)) if match else None
-        if "next" in hr_query.lower() or "more" in hr_query.lower():
-            return {"mode": "continue", "requirement": prev_requirement, "page": prev_page + 1, "page_size": prev_page_size, "top_k": top_k}
-        return {"mode": "new", "requirement": hr_query, "page": 1, "page_size": 20, "top_k": top_k}
 
-    response = llm(prompt, max_tokens=256, temperature=0.0, stop=["</s>"])
-    text = response["choices"][0]["text"].strip()
-    try:
-        return json.loads(text)
-    except:
-        # fallback same as above
-        match = re.search(r"top\s+(\d+)", hr_query.lower())
-        top_k = int(match.group(1)) if match else None
-        if "next" in hr_query.lower() or "more" in hr_query.lower():
-            return {"mode": "continue", "requirement": prev_requirement, "page": prev_page + 1, "page_size": prev_page_size, "top_k": top_k}
-        return {"mode": "new", "requirement": hr_query, "page": 1, "page_size": 20, "top_k": top_k}
-    
+
+
+
+
+
+
+
+
+
+
 
 
