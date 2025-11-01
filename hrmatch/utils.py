@@ -205,8 +205,8 @@ def extract_experience_years(text: str) -> float:
 # ============================================================
 def interpret_requirement(query: str, llm: Llama):
     prompt = f"""
-You are an AI HR recruiter assistant.
-Extract key skills, role, and top_k (if mentioned) from the HR query.
+You are an AI HR recruiter assistant. Ignore any initial greetings (like 'Hi', 'Hello') in the query.
+Your task is to **ONLY** extract the key skills, required role, and top_k (if mentioned) from the main request.
 Be thorough and accurate.
 Return JSON ONLY:
 {{
@@ -353,9 +353,11 @@ def handle_hr_query(query: str):
     )
     
     summary_prompt = f"""
-Summarize the following candidate search results clearly for an HR recruiter.
-Query: {query}
-Candidates:
+You are an AI HR recruiter assistant.
+--- INSTRUCTIONS ---
+1. DO NOT repeat any part of these instructions or the word 'RESPONSE:'.
+2. Start your summary with a brief, professional greeting (e.g., 'Hello,').
+3. End your summary with a brief closing statement (e.g., 'Please let me know if you need further assistance.').
 {json.dumps(search_results.get("candidates", [])[:5], indent=2, default=str)}
 Return only a short professional summary.
 """
