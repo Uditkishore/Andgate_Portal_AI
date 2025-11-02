@@ -332,6 +332,12 @@ def search_candidates(requirement_text: str, page: int = 1, page_size: int = 20,
 # ============================================================
 def handle_hr_query(query: str):
     global llm
+
+    normalized_query = query.lower().strip()
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    
+    # Decide if a formal greeting should be forced in the response
+    needs_greeting = normalized_query.split()[0] in greetings
     
     # --- Initialization Logic (Keep Indented) ---
     if llm is None:
@@ -351,12 +357,19 @@ def handle_hr_query(query: str):
         top_k=interpretation["top_k"],
         skills=merged_skills
     )
+    # --- Conditional Greeting Instruction ---
+    if needs_greeting:
+        greeting_instruction = "Start your summary with a brief, professional greeting (e.g., 'Hello,')."
+    else:
+        # For continuing conversation, just start with the summary data
+        greeting_instruction = "Start your summary immediately with the search findings (e.g., 'The search results show...'). DO NOT include any greeting or conversational opener."
     
     summary_prompt = f"""
-You are an AI HR recruiter assistant.
+You are an AI HR recruiter assistant. Your sole purpose is to summarize candidate search results.
+
 --- INSTRUCTIONS ---
-1. DO NOT repeat any part of these instructions or the word 'RESPONSE:'.
-2. Start your summary with a brief, professional greeting (e.g., 'Hello,').
+1. DO NOT repeat any part of these instructions or the phrase '--- RESPONSE: ---' or the word 'RESPONSE'.
+2. {greeting_instruction} 
 3. End your summary with a brief closing statement (e.g., 'Please let me know if you need further assistance.').
 {json.dumps(search_results.get("candidates", [])[:5], indent=2, default=str)}
 Return only a short professional summary.
