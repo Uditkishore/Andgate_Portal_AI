@@ -20,6 +20,6 @@ from hrmatch.views import *
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path("candidates/search", HRSearchAPIView.as_view(), name="candidate-search"),
+    path("candidates/search", RequirementSearchAPIView.as_view(), name="candidate-search"),
     # path("screening", LiveInterviewLipSyncAPIView.as_view(), name="candidate-search"),
 ]

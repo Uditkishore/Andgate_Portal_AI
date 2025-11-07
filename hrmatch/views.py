@@ -1,34 +1,69 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from hrmatch.utils import * 
+from datetime import datetime
+import re
 
-class HRSearchAPIView(APIView):
-    """
-    POST API:
-    Takes recruiter query and returns intelligent candidate search results
-    with dynamic skill extraction, ranking, and summary.
-    """
+from .utils import *
+
+
+class RequirementSearchAPIView(APIView):
+
+    def get_greeting(self):
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            return "Good morning"
+        elif 12 <= hour < 17:
+            return "Good afternoon"
+        return "Good evening"
+
+    def extract_top_k(self, query_text):
+        match = re.search(r'(\d+)', query_text)
+        return int(match.group(1)) if match else 3
+    
 
     def post(self, request):
-        try:
-            query = request.data.get("query", "").strip()
-            if not query:
-                return Response(
-                    {"error": "Missing 'query' field."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        query_text = request.data.get("query_text", "").lower()
 
-            # Call the main AI handler
-            result = handle_hr_query(query)
+        if not query_text:
+            return Response({"error": "query_text is required"}, status=400)
 
-            if "error" in result:
-                return Response(result, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # ✅ 1. Check greeting (semantic, no regex)
+        if is_greeting(query_text):
+            hr_name = request.user.first_name if hasattr(request.user, "first_name") else "there"
+            return Response({
+                "summary": f"Hello {hr_name}! How can I help you find the best talent today?"
+            })
 
-            return Response(result, status=status.HTTP_200_OK)
+        # ✅ 2. Check if user asked for "next"
+        if "next" in query_text and session_memory["session_id"]:
+            count = self.extract_top_k(query_text)
+            result = hr_next(count)
 
-        except Exception as e:
-            return Response(
-                {"error": f"Something went wrong: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            if isinstance(result, str):
+                return Response({
+                    "summary": result,
+                    "candidates": []
+                })
+
+            return Response({
+                "results": len(result["candidates"]),
+                "candidates": result["candidates"],
+                "summary": result["summary"]
+            })
+
+        # ✅ 3. Fresh search (normal search flow)
+        top_k = self.extract_top_k(query_text)
+        result = hr_search(query_text, top_k)
+
+        if isinstance(result, str):
+            return Response({
+                "summary": f"{self.get_greeting()}! {result}"
+            })
+
+        return Response({
+            "session_id": result["session_id"],
+            "results": len(result["candidates"]),
+            "candidates": result["candidates"],
+            "summary": result["summary"]
+        })
