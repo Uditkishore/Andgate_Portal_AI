@@ -19,8 +19,12 @@ db = client["Andgate_Portal"]
 uploads_collection = db["uploads"]
 
 # ✅ Load Mistral model (CPU)
+# PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# UPLOADS_DIR = os.path.join(PROJECT_ROOT, "AndgatePortal-1","backend","src", "uploads")
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOADS_DIR = os.path.join(PROJECT_ROOT, "src", "uploads")
+BASE_DIR = os.path.dirname(os.path.dirname(PROJECT_ROOT))
+UPLOADS_DIR = os.path.join(BASE_DIR, "AndgatePortal-1","backend","src","uploads")
 
 model_path = os.path.join(PROJECT_ROOT, "chatbot", "models", "mistral-7b-instruct-v0.1.Q4_0.gguf")
 # ✅ Load model
